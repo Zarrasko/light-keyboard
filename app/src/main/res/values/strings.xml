@@ -13,6 +13,7 @@
     <string name="setup_height">Keyboard height</string>
     <string name="setup_returnkey">Return key</string>
     <string name="setup_emojikey">Emoji keyboard</string>
+    <string name="setup_swipe">Swipe to type</string>
     <string name="layout_title">Keyboard layout</string>
     <string name="layout_back">← Back</string>
     <string name="height_title">Keyboard height</string>

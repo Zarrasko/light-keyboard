@@ -125,6 +125,9 @@ class SetupActivity : AppCompatActivity() {
         val emojiToggle = toggle(R.string.setup_emojikey, Prefs.emojiKey(this)) {
             Prefs.setEmojiKey(this, it)
         }
+        val swipeToggle = toggle(R.string.setup_swipe, Prefs.swipeEnabled(this)) {
+            Prefs.setSwipeEnabled(this, it)
+        }
 
         // Voice dictation row. The toggle keeps its normal padding so the row is exactly as tall as
         // every other toggle; the accessory (right) is a sibling view — tapping it doesn't flip the
@@ -221,7 +224,7 @@ class SetupActivity : AppCompatActivity() {
 
         listOf(
             titleView, blurbView, s1.row, s2.row,
-            autocorrectToggle, autocapToggle, autoperiodToggle, returnToggle, emojiToggle,
+            autocorrectToggle, autocapToggle, autoperiodToggle, returnToggle, emojiToggle, swipeToggle,
             voiceRow, voiceStatus!!,
             layoutRow, heightRow, tryRow,
         ).forEach { root.addView(it) }

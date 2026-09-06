@@ -35,6 +35,19 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     private val pending = HashMap<Int, String>()           // request sequence -> word
     private var seq = 0
 
+    // Words the user has explicitly kept despite the spell checker flagging them — autocorrect
+    // leaves these alone from now on. Loaded once; persisted via Prefs as each rejection happens.
+    private val rejectedWords: MutableSet<String> by lazy { HashSet(Prefs.rejectedCorrections(this)) }
+
+    // Bounded history of fixes actually applied this session (original -> fix), oldest evicted first.
+    // Lets a later, unmodified retype of [original] register as a rejection (see checkDelayedRejection),
+    // covering the case where the user notices and fixes a correction well after the fact — not just
+    // the single immediate backspace that [undoFrom]/[undoTo] already handle.
+    private val recentCorrections = object : LinkedHashMap<String, String>(16, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean =
+            size > MAX_RECENT_CORRECTIONS
+    }
+
     // Revert-on-backspace: after a correction the text before the cursor ends with [undoFrom];
     // the next backspace restores [undoTo] instead of deleting a character.
     private var undoFrom: String? = null
@@ -135,7 +148,12 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         }
         // A word terminator: try to fix the word, then commit [s].
         val original = if (autocorrectOn()) trailingWord() else ""
-        val fix = if (original.length >= 2) corrections[original] else null
+        if (original.length >= 2 && checkDelayedRejection(original)) {
+            clearUndo()
+            ic.commitText(s, 1)
+            return
+        }
+        val fix = if (original.length >= 2 && !isRejected(original)) corrections[original] else null
         if (fix != null && !fix.equals(original, ignoreCase = true)) {
             val cased = applyCase(original, fix)
             ic.beginBatchEdit()
@@ -145,6 +163,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
             ic.endBatchEdit()
             undoFrom = cased + s     // arm revert: text now ends with the fix + terminator
             undoTo = original + s
+            recentCorrections[original] = fix
         } else {
             clearUndo()
             ic.commitText(s, 1)
@@ -154,6 +173,22 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
                 lateTerminator = s
             }
         }
+    }
+
+    /** A swipe-typing gesture resolved to a whole word. It's dictionary-valid by construction, so
+     *  unlike a typed word it never goes through the spell-checker autocorrect path — only casing is
+     *  applied, mirroring what typing it letter-by-letter under the current shift state would produce.
+     *  Undo is whatever already works on typed text (single or long-press backspace); there's no
+     *  "original spelling" to instantly revert to the way there is for an autocorrect fix. */
+    override fun onWord(word: String) {
+        val ic = currentInputConnection ?: return
+        clearUndo()
+        val cased = when (keyboard?.currentCasing()) {
+            LightKeyboardView.WordCasing.ALL_CAPS -> word.uppercase()
+            LightKeyboardView.WordCasing.CAPITALIZE_FIRST -> word.replaceFirstChar { it.uppercaseChar() }
+            else -> word
+        }
+        ic.commitText("$cased ", 1)
     }
 
     override fun onBackspace() {
@@ -168,6 +203,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
                 ic.deleteSurroundingText(from.length, 0)
                 ic.commitText(to, 1)
                 ic.endBatchEdit()
+                rejectWord(to.dropLast(1))   // undoing a fix means "never do that to this word again"
                 return
             }
         }
@@ -209,13 +245,16 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         // Fix the last word before firing the action / newline.
         if (autocorrectOn()) {
             val original = trailingWord()
-            val fix = if (original.length >= 2) corrections[original] else null
-            if (fix != null && !fix.equals(original, ignoreCase = true)) {
-                val cased = applyCase(original, fix)
-                ic.beginBatchEdit()
-                ic.deleteSurroundingText(original.length, 0)
-                ic.commitText(cased, 1)
-                ic.endBatchEdit()
+            if (original.length >= 2 && !checkDelayedRejection(original)) {
+                val fix = if (!isRejected(original)) corrections[original] else null
+                if (fix != null && !fix.equals(original, ignoreCase = true)) {
+                    val cased = applyCase(original, fix)
+                    ic.beginBatchEdit()
+                    ic.deleteSurroundingText(original.length, 0)
+                    ic.commitText(cased, 1)
+                    ic.endBatchEdit()
+                    recentCorrections[original] = fix
+                }
             }
         }
         clearUndo()
@@ -270,7 +309,12 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
                 // Each finished segment commits to the field; dictation keeps going across pauses.
                 onSegment = { text ->
                     clearUndo()
-                    currentInputConnection?.commitText(spacedDictation(text), 1)
+                    val ic = currentInputConnection
+                    // Same signal updateShift() already uses for typed text's sentence-case auto-shift —
+                    // reused here instead of tracking dictation's own notion of "start of sentence".
+                    val sentenceStart = ic?.getCursorCapsMode(currentInputEditorInfo?.inputType ?: 0) != 0
+                    val cleaned = DictationCleanup.applyCasing(text, sentenceStart)
+                    ic?.commitText(spacedDictation(cleaned), 1)
                 },
                 onError = { msg ->
                     micActive = false
@@ -335,6 +379,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         if (!autocorrectOn()) return
         val s = spell ?: return
         if (word.length < 2 || word.length > 32) return
+        if (isRejected(word)) return   // the user has already told us to leave this word alone
         if (corrections.containsKey(word)) return
         if (word.any { it.isDigit() } || word.drop(1).any { it.isUpperCase() }) return // acronyms/odd
         val id = seq++
@@ -358,6 +403,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     /** A spell-check result came back after the word was already terminated. If "word + terminator" is
      *  still sitting right before the cursor (the user hasn't typed on), swap in the fix now. */
     private fun applyLateFix(original: String, fix: String) {
+        if (isRejected(original) || checkDelayedRejection(original)) return
         val ic = currentInputConnection ?: return
         val term = lateTerminator ?: return
         lateWord = null
@@ -371,6 +417,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         ic.endBatchEdit()
         undoFrom = cased + term
         undoTo = original + term
+        recentCorrections[original] = fix
     }
 
     override fun onGetSentenceSuggestions(results: Array<out SentenceSuggestionsInfo>?) {
@@ -416,11 +463,37 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         undoTo = null
     }
 
+    // ------------------------------------------------------------------ correction memory
+
+    private fun isRejected(word: String): Boolean = word.lowercase() in rejectedWords
+
+    /** Permanently stop autocorrecting [original]: the user has just told us, one way or another,
+     *  that this spelling is intentional. */
+    private fun rejectWord(original: String) {
+        val key = original.lowercase()
+        if (rejectedWords.add(key)) Prefs.addRejectedCorrection(this, key)
+        corrections.remove(original)
+        recentCorrections.remove(original)
+    }
+
+    /** True (and records the rejection) if [original] was corrected away earlier in this session and
+     *  the user has now retyped that exact original spelling as a fresh, complete word — i.e. they
+     *  noticed the fix later and put their own spelling back, rather than undoing it immediately with
+     *  the single-backspace path in [onBackspace]. */
+    private fun checkDelayedRejection(original: String): Boolean {
+        if (!recentCorrections.containsKey(original)) return false
+        rejectWord(original)
+        return true
+    }
+
     companion object {
         /** Broadcast so our overlays can dodge the keyboard. Implicit; caught by a runtime receiver. */
         const val ACTION_IME_VISIBILITY = "app.lightphonekeyboard.IME_VISIBILITY"
         const val EXTRA_VISIBLE = "visible"
         /** Window of text to inspect when deleting the last grapheme cluster (covers long emoji). */
         private const val GRAPHEME_LOOKBACK = 16
+        /** Cap on [recentCorrections] — a rolling window is enough to catch a delayed retype without
+         *  growing unbounded over a long typing session. */
+        private const val MAX_RECENT_CORRECTIONS = 25
     }
 }

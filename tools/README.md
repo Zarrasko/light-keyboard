@@ -20,3 +20,18 @@ python3 gen_charmodel.py /tmp/count_1w.txt \
 Source word list: Peter Norvig's `count_1w.txt` (Google Web Trillion Word Corpus unigrams).
 Tunables for accuracy (Gaussian width, context weight `lambda`, touch offset `biasX/biasY`) live in
 `LightKeyboardView.kt`, not here.
+
+## `gen_wordlist.py` — swipe-typing word list
+
+Generates `app/src/main/res/raw/wordlist.bin`, the word/frequency list `GestureDecoder` scores swipe
+candidates against. Ships directly in the APK (a few hundred KB), unlike the voice model.
+
+### Regenerate
+
+```sh
+curl -sL -o /tmp/count_1w.txt https://norvig.com/ngrams/count_1w.txt
+python3 gen_wordlist.py /tmp/count_1w.txt ../app/src/main/res/raw/wordlist.bin
+```
+
+Same source corpus as `gen_charmodel.py`. Keeps the top 60k pure a-z words (2-15 letters) by
+frequency; see the script's docstring for the exact binary format.

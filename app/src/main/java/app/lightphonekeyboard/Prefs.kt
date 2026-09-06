@@ -15,6 +15,8 @@ object Prefs {
     private const val KEY_TOUCH_OFFSETS = "touch_offsets"
     private const val KEY_LAYOUT = "key_layout"
     private const val KEY_HEIGHT = "key_height"
+    private const val KEY_REJECTED_CORRECTIONS = "rejected_corrections"
+    private const val KEY_SWIPE = "swipe_enabled"
 
     /** Keyboard letter arrangements; the stored value of [keyLayout]. */
     const val LAYOUT_QWERTY = "qwerty"
@@ -87,4 +89,23 @@ object Prefs {
 
     fun setVoiceEnabled(c: Context, value: Boolean) =
         prefs(c).edit().putBoolean(KEY_VOICE, value).apply()
+
+    /** Words (lowercase) the user has explicitly kept despite the spell checker flagging them —
+     *  autocorrect leaves these alone from now on. See [LightImeService.rejectWord]. */
+    fun rejectedCorrections(c: Context): Set<String> =
+        prefs(c).getStringSet(KEY_REJECTED_CORRECTIONS, emptySet()) ?: emptySet()
+
+    fun addRejectedCorrection(c: Context, word: String) {
+        val p = prefs(c)
+        val updated = HashSet(p.getStringSet(KEY_REJECTED_CORRECTIONS, emptySet()) ?: emptySet())
+        updated.add(word)
+        p.edit().putStringSet(KEY_REJECTED_CORRECTIONS, updated).apply()
+    }
+
+    /** Swipe (glide) typing on the letters layer. On by default — the word list ships in the APK,
+     *  so unlike voice dictation there's no download to gate it behind. */
+    fun swipeEnabled(c: Context): Boolean = prefs(c).getBoolean(KEY_SWIPE, true)
+
+    fun setSwipeEnabled(c: Context, value: Boolean) =
+        prefs(c).edit().putBoolean(KEY_SWIPE, value).apply()
 }

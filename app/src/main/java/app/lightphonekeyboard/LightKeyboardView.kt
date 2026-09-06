@@ -57,6 +57,8 @@ class LightKeyboardView @JvmOverloads constructor(
         fun onMic()
         /** Listening surface tapped — cancel dictation. */
         fun onMicCancel()
+        /** A full word committed by a completed swipe-typing gesture. */
+        fun onWord(word: String)
     }
 
     var listener: Listener? = null
@@ -114,6 +116,10 @@ class LightKeyboardView @JvmOverloads constructor(
     }
 
     private enum class Layer { LETTERS, SYMBOLS, MORE, EMOJI }
+
+    /** How a word committed all at once (by a swipe gesture) should be cased, mirroring what manually
+     *  typing it letter-by-letter would have produced under the current shift state. */
+    enum class WordCasing { NONE, CAPITALIZE_FIRST, ALL_CAPS }
 
     private var layer = Layer.LETTERS
     private var shifted = true
@@ -206,6 +212,7 @@ class LightKeyboardView @JvmOverloads constructor(
 
         keyLayout = Prefs.keyLayout(context)
         autoPeriod = Prefs.autoPeriod(context)
+        swipeEnabled = Prefs.swipeEnabled(context)
         hiddenKeys.clear()
         if (!Prefs.voiceEnabled(context)) hiddenKeys.add(Key.MIC)
         if (!Prefs.emojiKey(context)) hiddenKeys.add(Key.EMOJI)
@@ -232,6 +239,16 @@ class LightKeyboardView @JvmOverloads constructor(
     private var firstKeyRetractable = false   // did the gesture's first tap commit a retractable char?
     private var dismissedThisGesture = false
     private var velocityTracker: VelocityTracker? = null   // for early swipe-down (dismiss) detection
+
+    // --- swipe (glide) typing ---
+    // Loaded once; null (silently) if the bundled asset is missing/corrupt, which just means swipe
+    // typing never engages and every touch behaves exactly as it does today.
+    private val wordList: WordList? by lazy { WordList.load(resources) }
+    private val gestureDecoder: GestureDecoder? by lazy { wordList?.let { GestureDecoder(it) } }
+    private var swipeEnabled = true                 // cached like other prefs; refreshed in applyPrefs()
+    private var gestureActive = false                // true once the down-pointer has crossed into a 2nd key
+    private val gesturePath = ArrayList<GestureDecoder.Pt>()
+    private var gestureStartKeyId: String? = null    // the letter first touched, to detect crossing
 
     init {
         setBackgroundColor(Color.BLACK)
@@ -511,8 +528,10 @@ class LightKeyboardView @JvmOverloads constructor(
                 if (!dismissedThisGesture) {
                     val idx = ev.findPointerIndex(firstPointerId)
                     if (idx >= 0) {
-                        val dy = ev.getY(idx) - downY
-                        val dx = ev.getX(idx) - downX
+                        val x = ev.getX(idx)
+                        val y = ev.getY(idx)
+                        val dy = y - downY
+                        val dx = x - downX
                         velocityTracker?.computeCurrentVelocity(1000)
                         val vy = velocityTracker?.getYVelocity(firstPointerId) ?: 0f
                         // Recognise the dismiss swipe as early as possible so the char committed on
@@ -526,9 +545,38 @@ class LightKeyboardView @JvmOverloads constructor(
                             // The first tap already committed a char on down; retract it so the swipe
                             // doesn't leave a stray letter behind.
                             if (firstKeyRetractable) listener?.onBackspace()
+                            gestureActive = false
+                            gesturePath.clear()
                             pressed.clear()
                             invalidate()
                             listener?.onDismiss()
+                        } else if (gestureActive) {
+                            // Already gliding: keep sampling the path and highlighting the key underfoot.
+                            // findKey only (never resolveLetter) — these aren't aimed taps, so they must
+                            // not feed the per-tap touch-offset learning in resolveLetter/learnOffset.
+                            gesturePath.add(GestureDecoder.Pt(x, y))
+                            val key = findKey(x, y)
+                            if (key != null && key !== pressed[firstPointerId]) {
+                                pressed[firstPointerId] = key
+                                invalidate()
+                            }
+                        } else if (swipeEnabled && layer == Layer.LETTERS && ev.pointerCount == 1 &&
+                            gestureStartKeyId?.let(::isLetter) == true
+                        ) {
+                            // Crossing into a second, different letter key while still down: this is a
+                            // glide, not a tap. Rolling multi-finger typing is unaffected — it's tracked
+                            // via separate pointers (ACTION_POINTER_DOWN), never through this path.
+                            val key = findKey(x, y)
+                            if (key != null && isLetter(key.id) && key.id != gestureStartKeyId) {
+                                gestureActive = true
+                                if (firstKeyRetractable) {
+                                    listener?.onBackspace()
+                                    firstKeyRetractable = false   // don't retract twice if dismiss fires later
+                                }
+                                pressed[firstPointerId] = key
+                                gesturePath.add(GestureDecoder.Pt(x, y))
+                                invalidate()
+                            }
                         }
                     }
                 }
@@ -542,6 +590,7 @@ class LightKeyboardView @JvmOverloads constructor(
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (gestureActive) finishGesture(commit = ev.actionMasked == MotionEvent.ACTION_UP)
                 pressed.clear()
                 stopBackspaceRepeat()
                 velocityTracker?.recycle()
@@ -552,14 +601,45 @@ class LightKeyboardView @JvmOverloads constructor(
         return true
     }
 
+    /** Decode the just-completed glide into a word and commit it, or — on the rare gesture the
+     *  decoder can't place at all — fall back to whatever key the finger ended on, so a swipe never
+     *  silently produces nothing. No-op on [commit] == false (ACTION_CANCEL): nothing was left behind
+     *  to clean up since the initial tap's char was already retracted when the glide started. */
+    private fun finishGesture(commit: Boolean) {
+        gestureActive = false
+        val path = ArrayList(gesturePath)
+        gesturePath.clear()
+        gestureStartKeyId = null
+        if (!commit) return
+        val decoder = gestureDecoder ?: return
+        if (letterKeys.isEmpty()) return
+        val centers = HashMap<Char, GestureDecoder.Pt>()
+        for (k in letterKeys) centers[k.id[0]] = GestureDecoder.Pt(k.cx, k.cy)
+        val keyWidth = letterKeys.map { it.vis.width() }.average().toFloat()
+        val word = decoder.decode(path, centers, keyWidth)
+        if (word != null) {
+            listener?.onWord(word)
+        } else {
+            val last = path.lastOrNull() ?: return
+            findKey(last.x, last.y)?.let { listener?.onText(labelFor(it.id)) }
+        }
+    }
+
     /** Resolve the key under a pointer, commit it immediately, and light it up. */
     private fun pressDown(pointerId: Int, x: Float, y: Float): Boolean {
-        if (dismissedThisGesture) return false
+        if (dismissedThisGesture || gestureActive) return false
         val raw = findKey(x, y) ?: return false
         // Only letters get the accuracy treatment; control keys & other layers stay exact hit-testing.
         val key = if (layer == Layer.LETTERS && isLetter(raw.id)) resolveLetter(x, y, raw) else raw
         pressed[pointerId] = key
         invalidate()
+        if (pointerId == firstPointerId) {
+            // Seed the potential glide path with the actual down point, in case ACTION_MOVE later
+            // decides this touch is turning into a swipe rather than a tap.
+            gestureStartKeyId = key.id
+            gesturePath.clear()
+            gesturePath.add(GestureDecoder.Pt(x, y))
+        }
         val retractable = onKey(key.id)
         if (key.id == Key.BACKSPACE) {           // first delete fired on down; now arm the repeat
             backspacePointerId = pointerId
@@ -782,6 +862,9 @@ class LightKeyboardView @JvmOverloads constructor(
     fun reset(numeric: Boolean = false) {
         stopBackspaceRepeat()
         saveLearnedOffsets()   // persist what we learned in the field we're leaving
+        gestureActive = false
+        gesturePath.clear()
+        gestureStartKeyId = null
         applyPrefs()
         // Number / phone / date fields open straight on the symbols layer (its top row is 1-0).
         layer = if (numeric) Layer.SYMBOLS else Layer.LETTERS
@@ -828,6 +911,14 @@ class LightKeyboardView @JvmOverloads constructor(
             shifted = value
             if (layer == Layer.LETTERS) rebuild()
         }
+    }
+
+    /** How the *next* keystroke would be cased right now — used to case a whole word committed at
+     *  once by [Listener.onWord], since [labelFor] normally applies this per letter as it's typed. */
+    fun currentCasing(): WordCasing = when {
+        capsLock -> WordCasing.ALL_CAPS
+        shifted && layer == Layer.LETTERS -> WordCasing.CAPITALIZE_FIRST
+        else -> WordCasing.NONE
     }
 
     private fun tap() = performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
