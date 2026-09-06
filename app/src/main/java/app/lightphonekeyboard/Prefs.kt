@@ -17,6 +17,7 @@ object Prefs {
     private const val KEY_HEIGHT = "key_height"
     private const val KEY_REJECTED_CORRECTIONS = "rejected_corrections"
     private const val KEY_SWIPE = "swipe_enabled"
+    private const val KEY_SWIPE_DISMISS = "swipe_to_dismiss"
 
     /** Keyboard letter arrangements; the stored value of [keyLayout]. */
     const val LAYOUT_QWERTY = "qwerty"
@@ -108,4 +109,12 @@ object Prefs {
 
     fun setSwipeEnabled(c: Context, value: Boolean) =
         prefs(c).edit().putBoolean(KEY_SWIPE, value).apply()
+
+    /** Swipe DOWN on the keyboard to close it. On by default; turning it off frees up all directions
+     *  of movement for swipe typing and swaps in a small dismiss key instead (see LightKeyboardView's
+     *  DISMISS key). */
+    fun swipeToDismiss(c: Context): Boolean = prefs(c).getBoolean(KEY_SWIPE_DISMISS, true)
+
+    fun setSwipeToDismiss(c: Context, value: Boolean) =
+        prefs(c).edit().putBoolean(KEY_SWIPE_DISMISS, value).apply()
 }

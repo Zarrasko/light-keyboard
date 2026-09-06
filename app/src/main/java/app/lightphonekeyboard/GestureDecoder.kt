@@ -27,7 +27,12 @@ class GestureDecoder(private val wordList: WordList) {
     private val locationWeight = 1f
     private val freqWeight = 0.15f         // how much word frequency can tip a close shape/location call
     private val startEndSlack = 1.3f       // key-units of tolerance for the first/last-letter prefilter
-    private val maxCandidates = 400        // hard cap so one huge gesture can't blow up scoring cost
+    // Cap PER plausible starting letter, not overall: buckets are frequency-sorted (see WordList), so
+    // the top slice is exactly what's worth scoring, and every plausible letter gets a fair look
+    // regardless of how large its bucket is. A single global cap previously let one big bucket (some
+    // exceed 5,000 entries) exhaust the whole budget before a less common — but correct — candidate in
+    // a different letter's bucket was ever reached at all.
+    private val maxCandidatesPerLetter = 600
 
     /**
      * @param path the raw touch path for one continuous single-finger gesture (view pixel coords).
@@ -50,16 +55,13 @@ class GestureDecoder(private val wordList: WordList) {
 
         var best: String? = null
         var bestScore = Float.NEGATIVE_INFINITY
-        var scored = 0
 
-        outer@ for (letter in plausibleFirstLetters) {
-            for (entry in wordList.startingWith(letter)) {
-                if (scored >= maxCandidates) break@outer
+        for (letter in plausibleFirstLetters) {
+            for (entry in wordList.startingWith(letter).take(maxCandidatesPerLetter)) {
                 val word = entry.word
                 val lastCenter = keyCenters[word.last()] ?: continue
                 if (dist(last, lastCenter) > startEndSlack * keyWidth) continue
                 val ideal = idealPath(word, keyCenters) ?: continue
-                scored++
 
                 val resampledIdeal = resample(ideal, resamplePoints)
                 val (idealCx, idealCy) = centroid(resampledIdeal)

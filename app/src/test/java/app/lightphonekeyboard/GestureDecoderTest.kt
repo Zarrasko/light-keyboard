@@ -114,6 +114,36 @@ class GestureDecoderTest {
         assertNull(decoder.decode(farAway, centers, keyWidth))
     }
 
+    @Test fun largeBucketForOnePlausibleLetter_doesNotStarveAnother() {
+        // Regression test: the candidate cap used to be a single global budget shared across every
+        // plausible starting letter. A gesture whose start point sits near two candidate letters, one
+        // of which has a large word bucket, could exhaust that whole budget scanning the big bucket
+        // before the OTHER plausible letter's bucket — containing the actually-correct word — was ever
+        // reached at all. (This is exactly how a real "wet" swipe decoded to "er" instead: the down
+        // touch was plausibly close to both 'w' and 'e', 'e' has a huge bucket, and "wet" — bucketed
+        // under 'w' — was never scored.) The fix scores each plausible letter's bucket independently,
+        // so a big bucket for one letter can never crowd out another letter's bucket.
+        val centers = buildKeyCenters()
+        val entries = ArrayList<WordList.Entry>()
+        // Flood the 'r' bucket with far more than the per-letter cap, all real enough to pass the
+        // start/end-letter prefilter (start 'r', end 'n', like the target) so every one of them
+        // actually gets scored, not skipped for free.
+        repeat(1000) { i -> entries.add(WordList.Entry("r" + "a".repeat(i % 8 + 1) + "n", -5f)) }
+        // The true target: "then" (t-h-e-n), bucketed under 't' — a different plausible starting
+        // letter — with a much better (less negative) shape/location match than any filler above.
+        entries.add(WordList.Entry("then", -9f))
+        val words = WordList(entries)
+        val decoder = GestureDecoder(words)
+
+        // Start the gesture between 'r' and 't' (adjacent keys) so both are plausible first letters,
+        // then trace the rest of "then"'s own shape.
+        val rt = centers.getValue('r')
+        val tt = centers.getValue('t')
+        val path = listOf(GestureDecoder.Pt((rt.x + tt.x) / 2f, rt.y)) +
+            idealPathFor("then", centers).drop(0)
+        assertEquals("then", decoder.decode(path, centers, keyWidth))
+    }
+
     @Test fun wordList_bucketsByFirstLetter() {
         val words = wordList("cat" to 1.0, "car" to 1.0, "dog" to 1.0)
         assertEquals(setOf("cat", "car"), words.startingWith('c').map { it.word }.toSet())

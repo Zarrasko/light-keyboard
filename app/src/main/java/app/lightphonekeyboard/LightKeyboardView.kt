@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.drawable.Drawable
 import android.util.AttributeSet
@@ -71,6 +72,7 @@ class LightKeyboardView @JvmOverloads constructor(
         const val EMOJI = "__EMOJI__"
         const val EMOJI_BACK = "__EMOJI_BACK__"
         const val MIC = "__MIC__"
+        const val DISMISS = "__DISMISS__"
         const val SYMBOLS = "123"
         const val LETTERS = "ABC"
         const val MORE = "#+="
@@ -81,32 +83,32 @@ class LightKeyboardView @JvmOverloads constructor(
             listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p"),
             listOf("a", "s", "d", "f", "g", "h", "j", "k", "l"),
             listOf(Key.SHIFT, "z", "x", "c", "v", "b", "n", "m", Key.BACKSPACE),
-            listOf(Key.SYMBOLS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC),
+            listOf(Key.SYMBOLS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC, Key.DISMISS),
         )
         // French AZERTY and German QWERTZ — same control keys, only the three letter rows differ.
         val azerty = listOf(
             listOf("a", "z", "e", "r", "t", "y", "u", "i", "o", "p"),
             listOf("q", "s", "d", "f", "g", "h", "j", "k", "l", "m"),
             listOf(Key.SHIFT, "w", "x", "c", "v", "b", "n", Key.BACKSPACE),
-            listOf(Key.SYMBOLS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC),
+            listOf(Key.SYMBOLS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC, Key.DISMISS),
         )
         val qwertz = listOf(
             listOf("q", "w", "e", "r", "t", "z", "u", "i", "o", "p"),
             listOf("a", "s", "d", "f", "g", "h", "j", "k", "l"),
             listOf(Key.SHIFT, "y", "x", "c", "v", "b", "n", "m", Key.BACKSPACE),
-            listOf(Key.SYMBOLS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC),
+            listOf(Key.SYMBOLS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC, Key.DISMISS),
         )
         val symbols = listOf(
             listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
             listOf("-", "/", ":", ";", "(", ")", "$", "&", "@", "\""),
             listOf(Key.MORE, ".", ",", "?", "!", "'", Key.BACKSPACE),
-            listOf(Key.LETTERS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC),
+            listOf(Key.LETTERS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC, Key.DISMISS),
         )
         val more = listOf(
             listOf("[", "]", "{", "}", "#", "%", "^", "*", "+", "="),
             listOf("_", "\\", "|", "~", "<", ">", "€", "£", "¥"),
             listOf(Key.SYMBOLS, ".", ",", "?", "!", "'", Key.BACKSPACE),
-            listOf(Key.LETTERS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC),
+            listOf(Key.LETTERS, Key.EMOJI, Key.SPACE, Key.ENTER, Key.MIC, Key.DISMISS),
         )
         val emoji = listOf(
             "😅", "😊", "🙃", "😍", "😜", "😂", "😭", "😎",
@@ -213,10 +215,13 @@ class LightKeyboardView @JvmOverloads constructor(
         keyLayout = Prefs.keyLayout(context)
         autoPeriod = Prefs.autoPeriod(context)
         swipeEnabled = Prefs.swipeEnabled(context)
+        swipeToDismissEnabled = Prefs.swipeToDismiss(context)
         hiddenKeys.clear()
         if (!Prefs.voiceEnabled(context)) hiddenKeys.add(Key.MIC)
         if (!Prefs.emojiKey(context)) hiddenKeys.add(Key.EMOJI)
         if (!Prefs.returnKey(context)) hiddenKeys.add(Key.ENTER)
+        // The dismiss key is only needed as a substitute when the swipe-down gesture is off.
+        if (swipeToDismissEnabled) hiddenKeys.add(Key.DISMISS)
     }
 
     private val emojiCols = 8
@@ -246,9 +251,19 @@ class LightKeyboardView @JvmOverloads constructor(
     private val wordList: WordList? by lazy { WordList.load(resources) }
     private val gestureDecoder: GestureDecoder? by lazy { wordList?.let { GestureDecoder(it) } }
     private var swipeEnabled = true                 // cached like other prefs; refreshed in applyPrefs()
+    private var swipeToDismissEnabled = true        // cached like other prefs; refreshed in applyPrefs()
     private var gestureActive = false                // true once the down-pointer has crossed into a 2nd key
     private val gesturePath = ArrayList<GestureDecoder.Pt>()
     private var gestureStartKeyId: String? = null    // the letter first touched, to detect crossing
+    private val glideSlop = dpf(16)   // min drag distance before a touch can become a glide, not a tap
+    private val gestureTrailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        alpha = 190
+        style = Paint.Style.STROKE
+        strokeWidth = dpf(4)
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
 
     init {
         setBackgroundColor(Color.BLACK)
@@ -400,6 +415,18 @@ class LightKeyboardView @JvmOverloads constructor(
             }
             drawKey(canvas, pk)
         }
+        if (gestureActive) drawGestureTrail(canvas)
+    }
+
+    /** The finger's path so far during an active swipe-typing gesture — a plain white line, matching
+     *  the keyboard's pure black/white aesthetic (no gradient/fade chrome). Cleared as soon as the
+     *  gesture ends (see finishGesture / reset). */
+    private fun drawGestureTrail(canvas: Canvas) {
+        if (gesturePath.size < 2) return
+        val path = Path()
+        path.moveTo(gesturePath[0].x, gesturePath[0].y)
+        for (i in 1 until gesturePath.size) path.lineTo(gesturePath[i].x, gesturePath[i].y)
+        canvas.drawPath(path, gestureTrailPaint)
     }
 
     /** The voice-dictation surface: a big centered mic, the live status/partial text, and a hint. */
@@ -479,6 +506,7 @@ class LightKeyboardView @JvmOverloads constructor(
         Key.ENTER -> R.drawable.ic_kb_enter
         Key.EMOJI_BACK -> R.drawable.ic_kb_chevron_down
         Key.MIC -> R.drawable.ic_kb_mic
+        Key.DISMISS -> R.drawable.ic_kb_chevron_down
         Key.SHIFT -> if (shifted) R.drawable.ic_kb_chevron_down else R.drawable.ic_kb_chevron_up
         else -> null
     }
@@ -539,7 +567,9 @@ class LightKeyboardView @JvmOverloads constructor(
                         // letter: a short downward drag (30dp) OR a quick downward flick both count, as
                         // long as the motion is clearly vertical.
                         val verticalDrag = dy > abs(dx) * 1.5f
-                        if (verticalDrag && (dy > dpf(30) || (vy > dpf(900) && dy > dpf(14)))) {
+                        if (swipeToDismissEnabled && verticalDrag &&
+                            (dy > dpf(30) || (vy > dpf(900) && dy > dpf(14)))
+                        ) {
                             dismissedThisGesture = true
                             stopBackspaceRepeat()
                             // The first tap already committed a char on down; retract it so the swipe
@@ -554,18 +584,28 @@ class LightKeyboardView @JvmOverloads constructor(
                             // Already gliding: keep sampling the path and highlighting the key underfoot.
                             // findKey only (never resolveLetter) — these aren't aimed taps, so they must
                             // not feed the per-tap touch-offset learning in resolveLetter/learnOffset.
+                            // Invalidate on every sample (not just on key-change) so the trail follows
+                            // the finger smoothly instead of jumping key-to-key.
                             gesturePath.add(GestureDecoder.Pt(x, y))
                             val key = findKey(x, y)
-                            if (key != null && key !== pressed[firstPointerId]) {
-                                pressed[firstPointerId] = key
-                                invalidate()
-                            }
+                            if (key != null) pressed[firstPointerId] = key
+                            invalidate()
                         } else if (swipeEnabled && layer == Layer.LETTERS && ev.pointerCount == 1 &&
+                            (!swipeToDismissEnabled || !verticalDrag) &&
+                            sqrt(dx * dx + dy * dy) > glideSlop &&
                             gestureStartKeyId?.let(::isLetter) == true
                         ) {
                             // Crossing into a second, different letter key while still down: this is a
-                            // glide, not a tap. Rolling multi-finger typing is unaffected — it's tracked
-                            // via separate pointers (ACTION_POINTER_DOWN), never through this path.
+                            // glide, not a tap. Two guards keep this from stealing an ordinary tap or a
+                            // dismiss-swipe: [glideSlop] rejects the few px of jitter any real tap has —
+                            // without it, jitter that happens to cross into a neighboring key's hit-rect
+                            // (trivial on this gapless tiled surface) was constantly mistaken for a glide,
+                            // which is why swipes felt inaccurate — most of what was being decoded were
+                            // never real swipes. And while swipe-to-dismiss is on, a mostly-vertical drag
+                            // is left alone here entirely, so it can still clear the dismiss threshold above
+                            // on a later event instead of being claimed by glide first. Rolling multi-finger
+                            // typing is unaffected — it's tracked via separate pointers (POINTER_DOWN),
+                            // never through this path.
                             val key = findKey(x, y)
                             if (key != null && isLetter(key.id) && key.id != gestureStartKeyId) {
                                 gestureActive = true
@@ -827,6 +867,7 @@ class LightKeyboardView @JvmOverloads constructor(
             Key.MORE -> { layer = Layer.MORE; rebuild() }
             Key.LETTERS -> { layer = Layer.LETTERS; rebuild() }
             Key.MIC -> listener?.onMic()
+            Key.DISMISS -> listener?.onDismiss()
             Key.SPACE -> {
                 val now = System.currentTimeMillis()
                 val doublePeriod = autoPeriod && now - lastSpaceTapMs < DOUBLE_TAP_MS

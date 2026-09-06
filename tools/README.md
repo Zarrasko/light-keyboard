@@ -35,3 +35,9 @@ python3 gen_wordlist.py /tmp/count_1w.txt ../app/src/main/res/raw/wordlist.bin
 
 Same source corpus as `gen_charmodel.py`. Keeps the top 60k pure a-z words (2-15 letters) by
 frequency; see the script's docstring for the exact binary format.
+
+Words of 4 letters or fewer are additionally cross-checked against a system dictionary (auto-detected
+at `/usr/share/dict/words` on macOS/most Linux, or pass one explicitly as a 3rd argument) — raw web
+text isn't English-only, and a short non-English fragment ("et") can outrank a legitimate rarer-looking
+English word ("wet") on frequency alone. No dictionary found just skips the check (prints a warning)
+rather than failing the build.
