@@ -658,8 +658,16 @@ class LightKeyboardView @JvmOverloads constructor(
         if (word != null) {
             listener?.onWord(word)
         } else {
+            // No confident decode (common for a short/marginal gesture — exactly what an attempted
+            // swipe of a short word like "I"/"is"/"in"/"it" tends to produce). Still route this through
+            // onWord, not onText: onWord is what defers the trailing space for whatever comes next.
+            // Falling back to onText here was the actual bug behind "swiping a short i-word eats the
+            // next word's leading space" — the single fallback character never armed the pending-space
+            // state, so a following swipe (which only checks that state, doesn't insert unconditionally)
+            // silently ran straight into it with no space at all.
             val last = path.lastOrNull() ?: return
-            findKey(last.x, last.y)?.let { listener?.onText(labelFor(it.id)) }
+            val key = findKey(last.x, last.y) ?: return
+            if (isLetter(key.id)) listener?.onWord(key.id) else listener?.onText(labelFor(key.id))
         }
     }
 
