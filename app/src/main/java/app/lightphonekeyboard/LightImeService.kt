@@ -202,10 +202,22 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
      *
      *  The trailing space is deferred rather than committed here (see [consumePendingSwipeSpace]), so
      *  punctuation typed right after hugs the word instead of leaving "word ." — and a backspace right
-     *  after deletes the whole word instead of one character (see [onBackspace]). */
+     *  after deletes the whole word instead of one character (see [onBackspace]).
+     *
+     *  A leading space is needed here whenever something else is already sitting right before the
+     *  cursor with no separator — not just when [pendingSpaceAfterSwipe] says the previous action was
+     *  itself a swipe. Typed text (even a single unfinished letter — "i" typed, then "visit" swiped
+     *  right after, with no space in between) and punctuation both leave the flag unset, so checking it
+     *  alone missed those; checking the actual text, like [spacedDictation] already does, doesn't. */
     override fun onWord(word: String) {
         val ic = currentInputConnection ?: return
-        consumePendingSwipeSpace(insertSpace = true)   // separate from whatever (if anything) preceded
+        if (pendingSpaceAfterSwipe) {
+            consumePendingSwipeSpace(insertSpace = true)
+        } else {
+            swipedWordPending = null
+            val before = ic.getTextBeforeCursor(1, 0)?.toString().orEmpty()
+            if (before.isNotEmpty() && !before.last().isWhitespace()) ic.commitText(" ", 1)
+        }
         clearUndo()
         val cased = when (keyboard?.currentCasing()) {
             LightKeyboardView.WordCasing.ALL_CAPS -> word.uppercase()
