@@ -58,6 +58,12 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     private var lateWord: String? = null
     private var lateTerminator: String? = null
 
+    // A swiped word commits without its trailing space (see onWord) — the space is deferred until we
+    // see what actually follows, so punctuation hugs the word instead of "word ." A single backspace
+    // right after a swipe deletes the whole word, not one character (see onBackspace).
+    private var pendingSpaceAfterSwipe = false
+    private var swipedWordPending: String? = null
+
     private var micActive = false
 
     override fun onCreate() {
@@ -131,6 +137,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
 
     override fun onText(s: String) {
         val ic = currentInputConnection ?: return
+        consumePendingSwipeSpace(insertSpace = !(s.length == 1 && attachesWithoutSpace(s[0])))
         lateWord = null                    // any new input invalidates a pending late-correction
         lateTerminator = null
         if (s.length == 1 && isWordChar(s[0])) {
@@ -146,14 +153,28 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
             ic.commitText(s, 1)
             return
         }
-        // A word terminator: try to fix the word, then commit [s].
-        val original = if (autocorrectOn()) trailingWord() else ""
+        // A word terminator: capitalizing "i" always wins (a case-only fix, so it must be checked
+        // before the ignoreCase equality guard below, which would otherwise treat "I" == "i" as a
+        // no-op fix); then try the spell-checker fix, then commit [s].
+        val original = trailingWord()
+        val iFix = if (Prefs.autoCapitalize(this)) capitalizeI(original) else null
+        if (iFix != null) {
+            ic.beginBatchEdit()
+            ic.deleteSurroundingText(original.length, 0)
+            ic.commitText(iFix, 1)
+            ic.commitText(s, 1)
+            ic.endBatchEdit()
+            clearUndo()
+            return
+        }
         if (original.length >= 2 && checkDelayedRejection(original)) {
             clearUndo()
             ic.commitText(s, 1)
             return
         }
-        val fix = if (original.length >= 2 && !isRejected(original)) corrections[original] else null
+        val fix = if (autocorrectOn() && original.length >= 2 && !isRejected(original)) {
+            corrections[original]
+        } else null
         if (fix != null && !fix.equals(original, ignoreCase = true)) {
             val cased = applyCase(original, fix)
             ic.beginBatchEdit()
@@ -178,21 +199,33 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     /** A swipe-typing gesture resolved to a whole word. It's dictionary-valid by construction, so
      *  unlike a typed word it never goes through the spell-checker autocorrect path — only casing is
      *  applied, mirroring what typing it letter-by-letter under the current shift state would produce.
-     *  Undo is whatever already works on typed text (single or long-press backspace); there's no
-     *  "original spelling" to instantly revert to the way there is for an autocorrect fix. */
+     *
+     *  The trailing space is deferred rather than committed here (see [consumePendingSwipeSpace]), so
+     *  punctuation typed right after hugs the word instead of leaving "word ." — and a backspace right
+     *  after deletes the whole word instead of one character (see [onBackspace]). */
     override fun onWord(word: String) {
         val ic = currentInputConnection ?: return
+        consumePendingSwipeSpace(insertSpace = true)   // separate from whatever (if anything) preceded
         clearUndo()
         val cased = when (keyboard?.currentCasing()) {
             LightKeyboardView.WordCasing.ALL_CAPS -> word.uppercase()
             LightKeyboardView.WordCasing.CAPITALIZE_FIRST -> word.replaceFirstChar { it.uppercaseChar() }
             else -> word
         }
-        ic.commitText("$cased ", 1)
+        ic.commitText(cased, 1)
+        swipedWordPending = cased
+        pendingSpaceAfterSwipe = true
     }
 
     override fun onBackspace() {
         val ic = currentInputConnection ?: return
+        val pendingWord = swipedWordPending
+        swipedWordPending = null
+        pendingSpaceAfterSwipe = false
+        if (pendingWord != null && ic.getTextBeforeCursor(pendingWord.length, 0)?.toString() == pendingWord) {
+            ic.deleteSurroundingText(pendingWord.length, 0)
+            return
+        }
         val from = undoFrom
         val to = undoTo
         if (from != null && to != null) {
@@ -242,19 +275,24 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
 
     override fun onEnter() {
         val ic = currentInputConnection ?: return
+        consumePendingSwipeSpace(insertSpace = false)   // no space wanted before a newline
         // Fix the last word before firing the action / newline.
-        if (autocorrectOn()) {
-            val original = trailingWord()
-            if (original.length >= 2 && !checkDelayedRejection(original)) {
-                val fix = if (!isRejected(original)) corrections[original] else null
-                if (fix != null && !fix.equals(original, ignoreCase = true)) {
-                    val cased = applyCase(original, fix)
-                    ic.beginBatchEdit()
-                    ic.deleteSurroundingText(original.length, 0)
-                    ic.commitText(cased, 1)
-                    ic.endBatchEdit()
-                    recentCorrections[original] = fix
-                }
+        val original = trailingWord()
+        val iFix = if (Prefs.autoCapitalize(this)) capitalizeI(original) else null
+        if (iFix != null) {
+            ic.beginBatchEdit()
+            ic.deleteSurroundingText(original.length, 0)
+            ic.commitText(iFix, 1)
+            ic.endBatchEdit()
+        } else if (autocorrectOn() && original.length >= 2 && !checkDelayedRejection(original)) {
+            val fix = if (!isRejected(original)) corrections[original] else null
+            if (fix != null && !fix.equals(original, ignoreCase = true)) {
+                val cased = applyCase(original, fix)
+                ic.beginBatchEdit()
+                ic.deleteSurroundingText(original.length, 0)
+                ic.commitText(cased, 1)
+                ic.endBatchEdit()
+                recentCorrections[original] = fix
             }
         }
         clearUndo()
@@ -461,6 +499,35 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     private fun clearUndo() {
         undoFrom = null
         undoTo = null
+        swipedWordPending = null
+        pendingSpaceAfterSwipe = false
+    }
+
+    // ------------------------------------------------------------------ swipe follow-up
+
+    /** "i" (and its apostrophe contractions — i'm, i've, i'll, i'd) is always capitalized regardless of
+     *  sentence position, the one case-only fix every other keyboard applies that this one didn't. Null
+     *  if [word] isn't one of those. A pure case change, so callers must apply it before any ignoreCase
+     *  equality check against the original (which would otherwise treat "I" == "i" as nothing to do). */
+    private fun capitalizeI(word: String): String? = when {
+        word == "i" -> "I"
+        word.length > 1 && word[0] == 'i' && word[1] == '\'' -> "I" + word.substring(1)
+        else -> null
+    }
+
+    /** Punctuation that should hug the preceding word with no space before it, plus whitespace (which
+     *  supplies its own separation either way). Anything else — letters, opening brackets, digits —
+     *  needs [consumePendingSwipeSpace] to insert the deferred space first. */
+    private fun attachesWithoutSpace(c: Char): Boolean = c.isWhitespace() || c in ".,!?;:)"
+
+    /** Resolve the space deferred by a just-swiped word (see [onWord]): insert it now if whatever's
+     *  happening next needs one before it, or drop it silently if not. Also ends whole-word-backspace
+     *  eligibility for that word (see [onBackspace]) — both only apply to the very next action. */
+    private fun consumePendingSwipeSpace(insertSpace: Boolean) {
+        swipedWordPending = null
+        if (!pendingSpaceAfterSwipe) return
+        pendingSpaceAfterSwipe = false
+        if (insertSpace) currentInputConnection?.commitText(" ", 1)
     }
 
     // ------------------------------------------------------------------ correction memory

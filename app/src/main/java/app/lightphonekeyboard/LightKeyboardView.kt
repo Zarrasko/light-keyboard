@@ -168,7 +168,6 @@ class LightKeyboardView @JvmOverloads constructor(
     // live key width / rowPitch (so it rescales itself), and its language term (charmodel.bin) is
     // geometry-independent — see the "typing accuracy" section below. Only the px-stored learned vertical
     // offsets are height-specific, so applyPrefs() resets them when the preset changes.
-    private var compact = false                 // derived: true on Short (tighter control-key icon insets)
     private var appliedHeight: String? = null   // last preset applyPrefs() ran for, to detect a change
     private var padTop = 0f
     private var padBottom = 0f
@@ -179,6 +178,9 @@ class LightKeyboardView @JvmOverloads constructor(
     private var keyTextSize = 0f        // single-character key label
     private var labelTextSize = 0f      // multi-character key label (ABC / 123 / #+=)
     private var emojiTextSize = 0f
+    private var iconSize = 0f           // mic/enter/emoji/backspace/shift/dismiss glyph — matches
+                                         // keyTextSize so every icon key reads the same visual weight
+                                         // as a letter key, regardless of its own cell's width
 
     /** Cache all view-side prefs (size mode, layout, key visibility, Auto-Period). Idempotent;
      *  called on init and on every reset(), so settings changes take effect next time the keyboard opens. */
@@ -192,7 +194,6 @@ class LightKeyboardView @JvmOverloads constructor(
             Prefs.setTouchOffsets(context, "")
         }
         appliedHeight = height
-        compact = height == Prefs.HEIGHT_SHORT
         when (height) {
             Prefs.HEIGHT_SHORT -> {
                 padTop = dpf(4); padBottom = dpf(5); padSide = dpf(4)
@@ -211,6 +212,7 @@ class LightKeyboardView @JvmOverloads constructor(
             }
         }
         rowPitch = rowKeyH + keyGap * 2
+        iconSize = keyTextSize
 
         keyLayout = Prefs.keyLayout(context)
         autoPeriod = Prefs.autoPeriod(context)
@@ -476,7 +478,7 @@ class LightKeyboardView @JvmOverloads constructor(
         }
         val icon = iconFor(id)
         if (icon != null) {
-            drawIcon(canvas, icon, pk.vis, padFor(id))
+            drawIcon(canvas, icon, pk.vis)
             // Caps-lock indicator: an underline beneath the shift glyph.
             if (id == Key.SHIFT && capsLock) {
                 val cx = pk.vis.centerX()
@@ -491,9 +493,11 @@ class LightKeyboardView @JvmOverloads constructor(
         canvas.drawText(labelFor(id), pk.vis.centerX(), baseline, textPaint)
     }
 
-    private fun drawIcon(canvas: Canvas, res: Int, vis: RectF, pad: Float) {
+    private fun drawIcon(canvas: Canvas, res: Int, vis: RectF) {
         val d = iconCache.getOrPut(res) { context.getDrawable(res)!! }
-        val size = (minOf(vis.width(), vis.height()) - pad * 2).coerceAtLeast(1f)
+        // One consistent target size for every icon-bearing key (see [iconSize]), clamped to fit a
+        // narrower cell so it can never overflow into a neighboring key.
+        val size = iconSize.coerceAtMost(minOf(vis.width(), vis.height())).coerceAtLeast(1f)
         val left = (vis.centerX() - size / 2f).toInt()
         val top = (vis.centerY() - size / 2f).toInt()
         d.setBounds(left, top, (left + size).toInt(), (top + size).toInt())
@@ -511,13 +515,6 @@ class LightKeyboardView @JvmOverloads constructor(
         else -> null
     }
 
-    // Icon inset inside its key. Compact keys are shorter, so the insets shrink too or the glyphs vanish.
-    private fun padFor(id: String): Float = when (id) {
-        Key.SHIFT -> if (compact) dpf(6) else dpf(9)
-        Key.BACKSPACE, Key.EMOJI_BACK -> if (compact) dpf(7) else dpf(10)
-        Key.MIC -> if (compact) dpf(6) else dpf(9)
-        else -> if (compact) dpf(5) else dpf(7)
-    }
 
     private fun labelFor(id: String): String =
         if (shifted && layer == Layer.LETTERS && id.length == 1 && id[0].isLetter()) id.uppercase() else id
@@ -650,6 +647,7 @@ class LightKeyboardView @JvmOverloads constructor(
         val path = ArrayList(gesturePath)
         gesturePath.clear()
         gestureStartKeyId = null
+        lastSpaceTapMs = 0L   // a glide bypasses onKey(), which normally breaks a pending double-space
         if (!commit) return
         val decoder = gestureDecoder ?: return
         if (letterKeys.isEmpty()) return
