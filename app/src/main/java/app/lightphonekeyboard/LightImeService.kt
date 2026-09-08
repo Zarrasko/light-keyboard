@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -34,6 +36,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     private val corrections = HashMap<String, String?>()   // word -> fix (null = checked, no fix)
     private val pending = HashMap<Int, String>()           // request sequence -> word
     private var seq = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // Words the user has explicitly kept despite the spell checker flagging them — autocorrect
     // leaves these alone from now on. Loaded once; persisted via Prefs as each rejection happens.
@@ -98,11 +101,26 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         corrections.clear()
         pending.clear()
         clearUndo()
-        if (spell == null) initSpell()
+        // Refresh on every genuinely new field, not just when null: the underlying spell-check service
+        // can die independently of us (seen on-device as a flood of "DeadObjectException" from
+        // SpellCheckerSession) and [spell] then sits as a live-looking but permanently dead handle —
+        // every getSuggestions() call from it fails silently at the framework level, forever, with no
+        // exception for us to catch and no callback we can react to. This bounds how long autocorrect
+        // can stay silently broken to "until the next field is focused" instead of "until the process
+        // restarts". restarting == true (the same field reconnecting) intentionally skips this — no new
+        // field focus to hang the recovery off, and the mid-typing corrections cache is still valid.
+        if (!restarting) {
+            spell?.close()
+            spell = null
+            initSpell()
+        } else if (spell == null) {
+            initSpell()
+        }
         updateShift()
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)   // don't let a queued watchdog outlive the service
         dictation.destroy()
         spell?.close()
         spell = null
@@ -436,6 +454,21 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         pending[id] = word
         @Suppress("DEPRECATION")
         s.getSuggestions(arrayOf(TextInfo(word, 0, id)), 3, true)
+        // SpellCheckerSessionListener has no failure callback, and a dead underlying service (seen
+        // on-device: SpellCheckerSession logging "DeadObjectException" on every call) fails silently at
+        // the framework level — no exception reaches us, no callback ever fires, [pending] just grows
+        // forever. A request that's still unanswered after a generous margin is the only signal we get;
+        // treat it as a dead session and recreate, so autocorrect can recover within this same field
+        // instead of staying silently broken until the next one is focused.
+        mainHandler.postDelayed({ recoverIfSessionDead(id) }, SPELL_TIMEOUT_MS)
+    }
+
+    /** See [requestCheck]'s watchdog comment. No-op if [requestId] was already answered normally. */
+    private fun recoverIfSessionDead(requestId: Int) {
+        if (pending.remove(requestId) == null) return
+        spell?.close()
+        spell = null
+        initSpell()
     }
 
     override fun onGetSuggestions(results: Array<out SuggestionsInfo>?) {
@@ -574,5 +607,9 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         /** Cap on [recentCorrections] — a rolling window is enough to catch a delayed retype without
          *  growing unbounded over a long typing session. */
         private const val MAX_RECENT_CORRECTIONS = 25
+        /** A real spell-check round trip is normally near-instant (well under 100ms); this is a
+         *  generous margin before [recoverIfSessionDead] assumes the session is actually dead rather
+         *  than just slow. */
+        private const val SPELL_TIMEOUT_MS = 2000L
     }
 }
