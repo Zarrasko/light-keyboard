@@ -18,6 +18,7 @@ object Prefs {
     private const val KEY_REJECTED_CORRECTIONS = "rejected_corrections"
     private const val KEY_SWIPE = "swipe_enabled"
     private const val KEY_SWIPE_DISMISS = "swipe_to_dismiss"
+    private const val KEY_SWIPE_CORRECTIONS = "swipe_corrections"
 
     /** Keyboard letter arrangements; the stored value of [keyLayout]. */
     const val LAYOUT_QWERTY = "qwerty"
@@ -117,4 +118,24 @@ object Prefs {
 
     fun setSwipeToDismiss(c: Context, value: Boolean) =
         prefs(c).edit().putBoolean(KEY_SWIPE_DISMISS, value).apply()
+
+    /** Word-level corrections learned from swipe mistakes: wrong (lowercase) -> what the user actually
+     *  meant, recorded when they backspace-delete a just-swiped word and type/swipe something else in
+     *  its place. Stored as "wrong=correct" strings — words are a-z only, so '=' is a safe delimiter.
+     *  See [LightImeService.recordSwipeCorrectionIfPending]. */
+    fun swipeCorrections(c: Context): Map<String, String> {
+        val raw = prefs(c).getStringSet(KEY_SWIPE_CORRECTIONS, emptySet()) ?: emptySet()
+        return raw.mapNotNull { entry ->
+            val i = entry.indexOf('=')
+            if (i <= 0) null else entry.substring(0, i) to entry.substring(i + 1)
+        }.toMap()
+    }
+
+    fun addSwipeCorrection(c: Context, wrong: String, correct: String) {
+        val p = prefs(c)
+        val updated = HashSet(p.getStringSet(KEY_SWIPE_CORRECTIONS, emptySet()) ?: emptySet())
+        updated.removeAll { it.startsWith("$wrong=") }   // replace any previous mapping for this word
+        updated.add("$wrong=$correct")
+        p.edit().putStringSet(KEY_SWIPE_CORRECTIONS, updated).apply()
+    }
 }

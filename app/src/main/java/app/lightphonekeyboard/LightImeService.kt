@@ -67,6 +67,16 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     private var pendingSpaceAfterSwipe = false
     private var swipedWordPending: String? = null
 
+    // Swipe-correction memory: wrong (lowercase) -> what the user actually meant, learned when they
+    // backspace-delete a just-swiped word and type/swipe a different word right after. Loaded once;
+    // persisted via Prefs as each correction is recorded. The *values* (corrected words) are pushed to
+    // the keyboard view as a scoring nudge for GestureDecoder — see pushPersonalWords.
+    private val swipeCorrections: MutableMap<String, String> by lazy { HashMap(Prefs.swipeCorrections(this)) }
+    // Set right after a clean whole-word backspace of a swiped word (see onBackspace); consumed by
+    // whatever word completes next (typed or swiped) to record that pairing as a correction. Cleared by
+    // any other action in between, so only a genuine "delete and immediately replace" counts.
+    private var pendingSwipeCorrectionCheck: String? = null
+
     private var micActive = false
 
     override fun onCreate() {
@@ -78,6 +88,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     override fun onCreateInputView(): View {
         val kb = LightKeyboardView(this)
         kb.listener = this
+        kb.setPersonalWords(swipeCorrections.values.toSet())   // seed with whatever's already learned
         keyboard = kb
         return kb
     }
@@ -101,6 +112,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         corrections.clear()
         pending.clear()
         clearUndo()
+        pendingSwipeCorrectionCheck = null   // stale context in a new field — don't misattribute it
         // Refresh on every genuinely new field, not just when null: the underlying spell-check service
         // can die independently of us (seen on-device as a flood of "DeadObjectException" from
         // SpellCheckerSession) and [spell] then sits as a live-looking but permanently dead handle —
@@ -175,6 +187,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         // before the ignoreCase equality guard below, which would otherwise treat "I" == "i" as a
         // no-op fix); then try the spell-checker fix, then commit [s].
         val original = trailingWord()
+        recordSwipeCorrectionIfPending(original)
         val iFix = if (Prefs.autoCapitalize(this)) capitalizeI(original) else null
         if (iFix != null) {
             ic.beginBatchEdit()
@@ -229,6 +242,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
      *  alone missed those; checking the actual text, like [spacedDictation] already does, doesn't. */
     override fun onWord(word: String) {
         val ic = currentInputConnection ?: return
+        recordSwipeCorrectionIfPending(word)
         if (pendingSpaceAfterSwipe) {
             consumePendingSwipeSpace(insertSpace = true)
         } else {
@@ -254,8 +268,10 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         pendingSpaceAfterSwipe = false
         if (pendingWord != null && ic.getTextBeforeCursor(pendingWord.length, 0)?.toString() == pendingWord) {
             ic.deleteSurroundingText(pendingWord.length, 0)
+            pendingSwipeCorrectionCheck = pendingWord   // await a possible replacement, see onWord/onText
             return
         }
+        pendingSwipeCorrectionCheck = null   // any other backspace isn't a clean "delete and replace"
         val from = undoFrom
         val to = undoTo
         if (from != null && to != null) {
@@ -281,6 +297,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
     override fun onBackspaceWord() {
         val ic = currentInputConnection ?: return
         clearUndo()
+        pendingSwipeCorrectionCheck = null   // a long-press delete isn't the "swipe then replace" pattern
         val selected = ic.getSelectedText(0)
         if (!selected.isNullOrEmpty()) { ic.commitText("", 1); return }
         val before = ic.getTextBeforeCursor(64, 0) ?: ""
@@ -308,6 +325,7 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         consumePendingSwipeSpace(insertSpace = false)   // no space wanted before a newline
         // Fix the last word before firing the action / newline.
         val original = trailingWord()
+        recordSwipeCorrectionIfPending(original)
         val iFix = if (Prefs.autoCapitalize(this)) capitalizeI(original) else null
         if (iFix != null) {
             ic.beginBatchEdit()
@@ -573,6 +591,29 @@ class LightImeService : InputMethodService(), LightKeyboardView.Listener, SpellC
         if (!pendingSpaceAfterSwipe) return
         pendingSpaceAfterSwipe = false
         if (insertSpace) currentInputConnection?.commitText(" ", 1)
+    }
+
+    // ------------------------------------------------------------------ swipe correction memory
+
+    /** If the previous action was a clean whole-word delete of a swiped word (see [onBackspace]) and
+     *  [newWord] is what got typed or swiped in its place, remember that pairing: GestureDecoder gives
+     *  the corrected word a scoring boost from then on (see [pushPersonalWords]), so it's more likely
+     *  to win next time without being an absolute override — a gesture that's clearly a better match
+     *  for the "wrong" word can still resolve to it. No-op if nothing's pending, or if [newWord] is
+     *  just the same word retyped (not a correction). */
+    private fun recordSwipeCorrectionIfPending(newWord: String) {
+        val wrong = pendingSwipeCorrectionCheck ?: return
+        pendingSwipeCorrectionCheck = null
+        val wrongKey = wrong.lowercase()
+        val correct = newWord.lowercase()
+        if (correct.isEmpty() || correct == wrongKey) return
+        swipeCorrections[wrongKey] = correct
+        Prefs.addSwipeCorrection(this, wrongKey, correct)
+        pushPersonalWords()
+    }
+
+    private fun pushPersonalWords() {
+        keyboard?.setPersonalWords(swipeCorrections.values.toSet())
     }
 
     // ------------------------------------------------------------------ correction memory

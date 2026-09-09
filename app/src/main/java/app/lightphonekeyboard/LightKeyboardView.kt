@@ -258,6 +258,11 @@ class LightKeyboardView @JvmOverloads constructor(
     private val gesturePath = ArrayList<GestureDecoder.Pt>()
     private var gestureStartKeyId: String? = null    // the letter first touched, to detect crossing
     private val glideSlop = dpf(16)   // min drag distance before a touch can become a glide, not a tap
+    // Words the user has previously corrected a swipe *to* — pushed in live by the IME (see
+    // setPersonalWords) as corrections are recorded, not just re-read on the next field focus, so a
+    // correction benefits the very next swipe attempt in the same field. Passed through to
+    // GestureDecoder.decode() as a scoring nudge, not an override — see GestureDecoder's doc comment.
+    private var personalWords: Set<String> = emptySet()
     private val gestureTrailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         alpha = 190
@@ -654,7 +659,7 @@ class LightKeyboardView @JvmOverloads constructor(
         val centers = HashMap<Char, GestureDecoder.Pt>()
         for (k in letterKeys) centers[k.id[0]] = GestureDecoder.Pt(k.cx, k.cy)
         val keyWidth = letterKeys.map { it.vis.width() }.average().toFloat()
-        val word = decoder.decode(path, centers, keyWidth)
+        val word = decoder.decode(path, centers, keyWidth, personalWords)
         if (word != null) {
             listener?.onWord(word)
         } else {
@@ -967,6 +972,10 @@ class LightKeyboardView @JvmOverloads constructor(
         shifted && layer == Layer.LETTERS -> WordCasing.CAPITALIZE_FIRST
         else -> WordCasing.NONE
     }
+
+    /** Called by the IME whenever its swipe-correction memory changes (including once at startup, to
+     *  seed whatever was already learned) — see [personalWords]. */
+    fun setPersonalWords(words: Set<String>) { personalWords = words }
 
     private fun tap() = performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
 

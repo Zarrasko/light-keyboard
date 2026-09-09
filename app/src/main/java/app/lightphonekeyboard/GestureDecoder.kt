@@ -11,11 +11,22 @@ import kotlin.math.hypot
  * Pure Kotlin, no Android dependency — directly unit-testable, matching the existing pattern for the
  * tap-accuracy logic in [LightKeyboardView] (per the JUnit comment in app/build.gradle).
  *
- * Two signals per candidate, combined with word frequency:
+ * Two signals per candidate, combined with word frequency and (optionally) a small per-user
+ * personalization bonus:
  *   - shape: scale + position normalised point-to-point distance — "does this gesture have the same
  *     silhouette as swiping this word?", independent of exactly where or how big the swipe was.
- *   - location: centered but NOT rescaled distance — "does this gesture actually sit over this
- *     word's keys?", catching same-shape-different-place mismatches (e.g. "in" vs "on").
+ *   - location: same-frame, NOT rescaled distance — "does this gesture actually sit over this word's
+ *     keys?", catching same-shape-different-place mismatches (e.g. "in" vs "on").
+ *
+ * Both compare the two (already arc-length-resampled to the same count) paths point *i* to point *i*.
+ * Dynamic Time Warping was tried here instead, to better absorb a real swipe's uneven pace (people ease
+ * off at each letter and rush the straight stretches between them) — but rigorous testing found it
+ * backfires for exactly the case it was meant to help: unconstrained DTW can align many points of a
+ * long, complex path against just a handful of a *simpler* candidate's points, which systematically
+ * flatters short/simple words over longer ones regardless of which actually matches better. A bounded
+ * warping window (the standard fix for that) didn't help either — the pathological alignment didn't
+ * need much distance from the diagonal to occur, since a short word's resampled points already cluster
+ * close together. Reverted rather than ship something proven to make some real cases worse.
  */
 class GestureDecoder(private val wordList: WordList) {
 
@@ -27,6 +38,10 @@ class GestureDecoder(private val wordList: WordList) {
     private val locationWeight = 1f
     private val freqWeight = 0.15f         // how much word frequency can tip a close shape/location call
     private val startEndSlack = 1.3f       // key-units of tolerance for the first/last-letter prefilter
+    // Flat score bonus for a word the user has previously corrected a swipe *to* (see [decode]'s
+    // personalWords param). Sized to tip a genuinely close call without acting as an absolute override
+    // — a candidate with a clearly better shape/location match can still win regardless.
+    private val personalWordBoost = 0.6f
     // Cap PER plausible starting letter, not overall: buckets are frequency-sorted (see WordList), so
     // the top slice is exactly what's worth scoring, and every plausible letter gets a fair look
     // regardless of how large its bucket is. A single global cap previously let one big bucket (some
@@ -39,9 +54,15 @@ class GestureDecoder(private val wordList: WordList) {
      * @param keyCenters current key center for every letter key, in the same pixel coordinate space.
      * @param keyWidth current letter key width (px) — normalises distances so scoring is the same
      *   regardless of keyboard height preset.
+     * @param personalWords words this user has previously corrected a swipe *to* (see
+     *   LightImeService's swipe-correction memory) — each gets [personalWordBoost] added to its score,
+     *   enough to win a close call but not to override a candidate that's clearly a better match.
      * @return the best-scoring dictionary word, or null if nothing plausible was found.
      */
-    fun decode(path: List<Pt>, keyCenters: Map<Char, Pt>, keyWidth: Float): String? {
+    fun decode(
+        path: List<Pt>, keyCenters: Map<Char, Pt>, keyWidth: Float,
+        personalWords: Set<String> = emptySet(),
+    ): String? {
         if (path.size < 2 || keyCenters.isEmpty() || keyWidth <= 0f) return null
         val first = path.first()
         val last = path.last()
@@ -70,7 +91,8 @@ class GestureDecoder(private val wordList: WordList) {
                 )
                 val locationDist = locationDistance(resampledPath, resampledIdeal, keyWidth)
                 val score = -shapeWeight * shapeDist - locationWeight * locationDist +
-                    freqWeight * entry.logFreq
+                    freqWeight * entry.logFreq +
+                    if (word in personalWords) personalWordBoost else 0f
                 if (score > bestScore) { bestScore = score; best = word }
             }
         }
@@ -149,8 +171,8 @@ class GestureDecoder(private val wordList: WordList) {
         return sum / a.size
     }
 
-    /** Centered but NOT rescaled distance ("location" in SHARK2 terms) — catches a gesture that has
-     *  the right silhouette but sits over the wrong keys. */
+    /** Same-frame, NOT rescaled point-to-point distance ("location" in SHARK2 terms) — catches a
+     *  gesture that has the right silhouette but sits over the wrong keys. */
     private fun locationDistance(a: List<Pt>, b: List<Pt>, keyWidth: Float): Float {
         var sum = 0f
         for (i in a.indices) sum += dist(a[i], b[i])

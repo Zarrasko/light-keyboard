@@ -144,6 +144,62 @@ class GestureDecoderTest {
         assertEquals("then", decoder.decode(path, centers, keyWidth))
     }
 
+    @Test fun nonUniformPace_stillDecodesTheLongerWord() {
+        // Guards a real on-device miss: a slow, deliberate swipe of "marathon" (hesitating at each
+        // letter, moving quickly between them) was reported decoding as "main" — a much more frequent
+        // word sharing marathon's first and last letter. Dynamic Time Warping was tried as a fix (to
+        // better absorb the uneven pace) but rigorous testing found it backfires: unconstrained DTW
+        // systematically flatters short/simple candidates by aligning many of the long path's points
+        // against just a handful of the simple candidate's, and a bounded warping window didn't rescue
+        // it either. Reverted — plain arc-length resampling + same-index comparison already gets this
+        // specific case right (it's what the assertion below checks), so this pins that down against a
+        // future regression. The real on-device miss most likely wasn't pure pacing, since a synthetic
+        // hesitant path already decodes correctly here; a genuinely different-shaped real gesture (an
+        // imprecise or short-cut path) is the more likely explanation, which the swipe-correction
+        // memory feature (personalWords, see the test below) addresses directly regardless of the exact
+        // cause, once the user corrects it once.
+        val centers = buildKeyCenters()
+        // Matches the real bundled word list's actual frequency gap between these two words (~32x —
+        // ln(main/total) - ln(marathon/total) = 3.47 there), not an arbitrarily harsher ratio.
+        val words = wordList("marathon" to 200.0, "main" to 6400.0)
+        val decoder = GestureDecoder(words)
+
+        val letters = "marathon".map { centers.getValue(it) }
+        val hesitant = ArrayList<GestureDecoder.Pt>()
+        for (i in letters.indices) {
+            val p = letters[i]
+            // Linger at this letter (small jitter, many samples)...
+            repeat(6) { j -> hesitant.add(GestureDecoder.Pt(p.x + (j % 3 - 1), p.y + (j % 2))) }
+            // ...then a sparse, fast transition to the next.
+            if (i < letters.lastIndex) {
+                val next = letters[i + 1]
+                hesitant.add(GestureDecoder.Pt((p.x + next.x) / 2f, (p.y + next.y) / 2f))
+            }
+        }
+        assertEquals("marathon", decoder.decode(hesitant, centers, keyWidth))
+    }
+
+    @Test fun personalWords_tipsAGenuinelyCloseCall() {
+        // "cat"/"car" is the same close-call shape as ambiguousShape_frequencyBreaksTheTie, but with
+        // the roles reversed: "cat" only wins here because "car" is a learned correction target.
+        val centers = buildKeyCenters()
+        val words = wordList("cat" to 5.0, "car" to 5000.0)
+        val decoder = GestureDecoder(words)
+        val path = idealPathFor("cat", centers).toMutableList()
+        val tPt = centers.getValue('t')
+        val rPt = centers.getValue('r')
+        path[path.lastIndex] = GestureDecoder.Pt((tPt.x + rPt.x) / 2f, (tPt.y + rPt.y) / 2f)
+
+        assertEquals("car", decoder.decode(path, centers, keyWidth))   // baseline: frequency wins
+        // The boost alone shouldn't overturn a landslide frequency gap like this one.
+        assertEquals("car", decoder.decode(path, centers, keyWidth, personalWords = setOf("cat")))
+        // A user-confirmed word closes a close-call gap; it shouldn't relitigate a landslide.
+        val closeWords = wordList("cat" to 100.0, "car" to 140.0)
+        val closeDecoder = GestureDecoder(closeWords)
+        assertEquals("car", closeDecoder.decode(path, centers, keyWidth))
+        assertEquals("cat", closeDecoder.decode(path, centers, keyWidth, personalWords = setOf("cat")))
+    }
+
     @Test fun wordList_bucketsByFirstLetter() {
         val words = wordList("cat" to 1.0, "car" to 1.0, "dog" to 1.0)
         assertEquals(setOf("cat", "car"), words.startingWith('c').map { it.word }.toSet())
